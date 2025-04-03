@@ -10,12 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv" // 为 parseSize 添加
-	"strings" // 为 parseSize 添加
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/unix" // 使用 unix 包代替 syscall
+	"golang.org/x/sys/unix" // Use unix package instead of syscall (preferred for Linux)
 )
 
 func formatWithCommas(n int64) string {
@@ -100,23 +100,19 @@ func main() {
 	}
 	flag.Parse()
 
-	// 强制要求Linux系统
 	if runtime.GOOS != "linux" {
 		log.Fatal("错误: 此程序只能在Linux系统上运行")
 	}
 
-	// 如果没有提供任何参数，则显示用法并退出
 	if len(os.Args) == 1 {
 		flag.Usage()
 		os.Exit(0)
 	}
 
-	// 参数校验
 	if *mode == "send" {
 		if *file == "" {
 			log.Fatal("错误: send 模式下必须指定 -file 参数")
 		}
-		// 如果发送 /dev/zero，则必须指定 -size
 		if *file == "/dev/zero" && *sizeStr == "" {
 			log.Fatal("错误: 使用 -file /dev/zero 时必须指定 -size 参数")
 		}
@@ -130,28 +126,23 @@ func main() {
 		log.Fatal("错误: receive 模式下必须指定 -dir 参数")
 	}
 
-	// 保留对非Linux系统的额外警告
 	if runtime.GOOS != "linux" {
 		log.Printf("\x1b[33m警告: 当前系统 %s 非 Linux，程序功能可能受限\x1b[0m", runtime.GOOS)
 	}
 
-	// --- 文件预热 (如果需要) ---
 	if *mode == "send" && *prewarm && *file != "/dev/zero" {
-		// 直接调用 doPrewarm，它将自行获取文件大小并预热整个文件
 		if err := doPrewarm(*file); err != nil {
-			// 预热失败仅记录警告，不中断程序
+			// Prewarming failure is logged as a warning but doesn't stop the process
 			log.Printf("\x1b[33m警告: 文件预热失败: %v\x1b[0m", err)
 		}
 	}
 
 	switch *mode {
-	case "send": // 客户端
+	case "send":
 		var err error
 		if *file == "/dev/zero" {
-			// 对于 /dev/zero，调用特殊版本的 sender 或传递大小
-			// 这里我们先简单处理，后面修改 sender 函数内部逻辑
 			log.Printf("检测到发送 /dev/zero，将使用 -size 指定的大小并采用标准网络写入")
-			err = sender(*file, *addr) // sender 内部需要处理 /dev/zero 情况
+			err = sender(*file, *addr) // sender handles /dev/zero internally
 		} else {
 			err = sender(*file, *addr)
 		}
@@ -172,8 +163,8 @@ func main() {
 		} else {
 			fmt.Println("文件发送成功完成.")
 		}
-	case "receive": // 服务器
-		err := receiver(*dir, *addr, *noSplice) // receiver 内部需要处理 /dev/null 情况
+	case "receive":
+		err := receiver(*dir, *addr, *noSplice) // receiver handles /dev/null internally
 		if err != nil {
 			log.Fatalf("\x1b[31m接收端错误: %v\x1b[0m", err)
 		}
@@ -183,7 +174,7 @@ func main() {
 	}
 }
 
-// 记录失败的文件
+// logFailedFile records details about failed transfers.
 func logFailedFile(filePath string, reason string) {
 	f, err := os.OpenFile(badFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -265,7 +256,6 @@ func sender(filePath string, connectAddr string) error {
 
 	var fileSize int64
 	var fileName string
-	// var err error // err 已在 net.DialTimeout 处通过 := 声明，移除重复声明
 
 	if isDevZero {
 		fileSize, err = parseSize(*sizeStr) // 从 -size 获取大小
@@ -307,8 +297,6 @@ func sender(filePath string, connectAddr string) error {
 		return fmt.Errorf("发送文件大小失败: %w", err)
 	}
 	log.Printf("\x1b[32m已发送文件大小: %s\x1b[0m", formatWithCommas(fileSize))
-	// 预热逻辑已移到 main 函数
-	// (移除因之前 diff 错误而残留的多余右括号)
 
 	// 对于 /dev/zero，我们不需要打开它然后用 sendfile，直接写网络
 	// 对于常规文件，才需要打开并获取 fd
@@ -325,17 +313,15 @@ func sender(filePath string, connectAddr string) error {
 	}
 
 	// 获取网络连接的 fd (sendfile 需要) 或直接使用 conn (标准写入需要)
-	var dstFd int = -1 // 初始化为无效值
-	if !isDevZero {    // 移除 runtime.GOOS 检查，因为程序入口已保证是 Linux
+	var dstFd int = -1
+	if !isDevZero {
 		tcpConn, ok := conn.(*net.TCPConn)
 		if !ok {
 			log.Printf("\x1b[33m警告: 连接不是 TCP 连接，无法使用 sendfile，将回退到标准写入\x1b[0m")
-			// isDevZero 已经是 false, 所以会进入下面的 else 分支
 		} else {
 			dstFile, err := tcpConn.File()
 			if err != nil {
 				log.Printf("\x1b[33m警告: 获取连接文件描述符失败 (%v)，无法使用 sendfile，将回退到标准写入\x1b[0m", err)
-				// isDevZero 已经是 false, 所以会进入下面的 else 分支
 			} else {
 				defer dstFile.Close()
 				dstFd = int(dstFile.Fd())
@@ -349,7 +335,6 @@ func sender(filePath string, connectAddr string) error {
 	go displayProgress(fileSize, &transferred, startTime, done)
 	defer close(done)
 
-	// var offset int64 = 0 // 移到 sendfile 逻辑块内部
 	totalSent := int64(0)
 
 	if fileSize == 0 {
@@ -359,7 +344,7 @@ func sender(filePath string, connectAddr string) error {
 	}
 
 	// 根据情况选择传输方式
-	if !isDevZero && srcFd != -1 && dstFd != -1 { // 移除 runtime.GOOS 检查
+	if !isDevZero && srcFd != -1 && dstFd != -1 { // No need to check runtime.GOOS
 		// 使用 sendfile (Linux 上的常规文件)
 		log.Printf("使用 sendfile 传输文件 %s", filePath)
 		var offset int64 = 0 // sendfile 需要 offset，在此声明
@@ -369,7 +354,7 @@ func sender(filePath string, connectAddr string) error {
 			if remaining < count {
 				count = remaining
 			}
-			currentOffset := offset // 记录当前偏移量用于错误报告
+			currentOffset := offset
 			n, err := unix.Sendfile(dstFd, srcFd, &offset, int(count))
 			if err != nil {
 				if errno, ok := err.(unix.Errno); ok && errno == unix.EIO {
@@ -424,9 +409,9 @@ func sender(filePath string, connectAddr string) error {
 			return fmt.Errorf("标准写入失败 (已发送 %d bytes): %w", totalSent, err)
 		}
 		log.Printf("\x1b[32m标准网络写入完成，总共发送 %d bytes\x1b[0m", totalSent)
-	} // End of if/else for transfer method
+	}
 
-	// Short sleep to allow progress display to potentially catch up
+	// Short sleep allows the progress display goroutine to potentially update one last time
 	time.Sleep(100 * time.Millisecond)
 
 	// Final check: ensure total sent bytes match the expected file size
@@ -436,10 +421,10 @@ func sender(filePath string, connectAddr string) error {
 
 	log.Printf("发送完成，总共发送 %s bytes", formatWithCommas(totalSent)) // Generic completion message
 	return nil
-} // End of sender function
+}
 
 // --- 文件预热函数 (使用 Readahead 预热整个文件) ---
-func doPrewarm(filePath string) error { // 移除 prewarmBytes 参数
+func doPrewarm(filePath string) error {
 	log.Printf("发起预读请求: 文件 %s (整个文件)...", filePath)
 	prewarmStartTime := time.Now()
 
@@ -460,10 +445,7 @@ func doPrewarm(filePath string) error { // 移除 prewarmBytes 参数
 	}
 	defer f.Close()
 	fd := int(f.Fd())
-	// 使用 unix.Syscall 调用 readahead(2)
-	// int fd, off64_t offset, size_t count
-	// 使用获取到的文件大小进行 Readahead
-	_, _, err = unix.Syscall(unix.SYS_READAHEAD, uintptr(fd), uintptr(0), uintptr(fileSize)) // 使用 = 赋值给已声明的 err
+	_, _, err = unix.Syscall(unix.SYS_READAHEAD, uintptr(fd), uintptr(0), uintptr(fileSize))
 
 	prewarmDuration := time.Since(prewarmStartTime)
 
@@ -505,7 +487,7 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 		}
 
 		// --- 开始处理单个连接 ---
-		remoteAddrStr := conn.RemoteAddr().String() // 获取远程地址字符串，方便日志记录
+		remoteAddrStr := conn.RemoteAddr().String()
 		log.Printf("[%s] 接收到连接，开始处理...", remoteAddrStr)
 
 		// 声明变量来保存传输结果，以便在匿名函数外访问
@@ -531,7 +513,6 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			// 记录当前连接开始时间
 			connectionStart = time.Now()
 
-			// 声明变量
 			var targetPath string
 			var receiveErr error
 			var fileName string
@@ -554,7 +535,7 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			lenBytes := make([]byte, 2)
 			if _, err := io.ReadFull(conn, lenBytes); err != nil {
 				receiveErr = fmt.Errorf("读取文件名长度失败: %w", err)
-				return // 退出匿名函数
+				return
 			}
 			fileNameLen := binary.BigEndian.Uint16(lenBytes)
 			log.Printf("\x1b[32m[%s] 接收到文件名长度: %d\x1b[0m", remoteAddrStr, fileNameLen)
@@ -563,7 +544,7 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			fileNameBytes := make([]byte, fileNameLen)
 			if _, err := io.ReadFull(conn, fileNameBytes); err != nil {
 				receiveErr = fmt.Errorf("读取文件名失败: %w", err)
-				return // 退出匿名函数
+				return
 			}
 			fileName = string(fileNameBytes)
 			log.Printf("\x1b[32m[%s] 接收到文件名: %s\x1b[0m", remoteAddrStr, fileName)
@@ -572,7 +553,7 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			sizeBytes := make([]byte, 8)
 			if _, err := io.ReadFull(conn, sizeBytes); err != nil {
 				receiveErr = fmt.Errorf("读取文件大小失败: %w", err)
-				return // 退出匿名函数
+				return
 			}
 			fileSize = int64(binary.BigEndian.Uint64(sizeBytes))
 			log.Printf("\x1b[32m[%s] 文件大小: %s 字节\x1b[0m", remoteAddrStr, formatWithCommas(fileSize))
@@ -586,15 +567,12 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 				// 仅在目标不是 /dev/null 时才创建目录
 				if err := os.MkdirAll(dirPath, 0755); err != nil {
 					receiveErr = fmt.Errorf("创建目录 '%s' 失败: %w", dirPath, err)
-					return // 退出匿名函数
+					return
 				}
 				targetPath = filepath.Join(dirPath, fileName)
 				log.Printf("\x1b[32m[%s] 将文件 '%s' 保存到: %s\x1b[0m", remoteAddrStr, fileName, targetPath)
 			}
-			// targetPath 现在已根据 isDevNull 正确设置
 
-			// 创建或打开目标文件/设备
-			// var openFlags int // 移到 else 块内部声明
 			// 创建或打开目标文件/设备
 			var dstFile *os.File
 			var err error
@@ -609,12 +587,8 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 				// 打开常规文件，处理 O_DIRECT
 				openFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 				if *oDirect {
-					// if runtime.GOOS == "linux" { // 移除检查，因为入口已保证是 Linux
 					openFlags |= unix.O_DIRECT
 					log.Printf("\x1b[33m[%s] 警告: 使用 O_DIRECT 打开文件 %s。这将绕过页缓存，可能影响性能，并有严格的对齐要求。标准 IO 模式 (-no-splice) 可能无法正常工作。\x1b[0m", remoteAddrStr, targetPath)
-					// } else { // 移除 else 分支，因为非 Linux 情况已在入口处理
-					//	log.Printf("[%s] 警告: -odirect 标志仅在 Linux 上生效，当前系统 %s 将忽略此标志。", remoteAddrStr, runtime.GOOS)
-					// }
 				}
 				dstFile, err = os.OpenFile(targetPath, openFlags, 0644)
 				if err != nil {
@@ -625,9 +599,9 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			defer dstFile.Close()
 
 			// 预分配（仅对常规文件且在 Linux 上）
-			if !isDevNull && fileSize > 0 { // 移除 runtime.GOOS 检查
+			if !isDevNull && fileSize > 0 { // No need to check runtime.GOOS
 				// 检查是否真的打开了常规文件（dstFile 可能因错误为 nil）
-				if dstFile != nil { // 确保 dstFile 不是 nil
+				if dstFile != nil {
 					if err := unix.Fallocate(int(dstFile.Fd()), 0, 0, fileSize); err != nil {
 						// 预分配失败通常不是致命错误，记录警告即可
 						log.Printf("\x1b[33m[%s] 警告: 预分配文件空间 '%s' 失败: %v\x1b[0m", remoteAddrStr, targetPath, err)
@@ -644,29 +618,29 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 
 			if fileSize == 0 {
 				atomic.StoreInt64(&transferred, 0)
-				time.Sleep(100 * time.Millisecond) // 确保进度显示能更新为 100%
-				return                             // 空文件接收成功，退出匿名函数
+				time.Sleep(100 * time.Millisecond)
+				return
 			}
 
 			// 获取TCP连接的文件描述符
 			tcpConn, ok := conn.(*net.TCPConn)
 			if !ok {
 				receiveErr = fmt.Errorf("连接不是 TCP 连接")
-				return // 退出匿名函数
+				return
 			}
 
 			srcFile, err := tcpConn.File()
 			if err != nil {
 				receiveErr = fmt.Errorf("获取连接文件描述符失败: %w", err)
-				return // 退出匿名函数
+				return
 			}
 			defer srcFile.Close()
 
-			// 获取文件描述符
+			// Get file descriptors
 			srcFd := int(srcFile.Fd())
 			dstFd := int(dstFile.Fd())
 
-			// --- 开始传输 ---
+			// --- Begin transfer ---
 			if useStandardCopy {
 				log.Printf("[%s] 使用标准 IO 复制而不是 splice", remoteAddrStr)
 				buffer := make([]byte, copyBufferSize)
@@ -703,8 +677,8 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 				}()
 
 				// 处理写入
-				for data := range readCh { // 接收数据副本
-					written, err := dstFile.Write(data) // 写入副本
+				for data := range readCh {
+					written, err := dstFile.Write(data)
 					if err != nil {
 						select {
 						case errorCh <- fmt.Errorf("[%s] 写入文件 '%s' 失败: %w", remoteAddrStr, targetPath, err):
@@ -729,20 +703,20 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 				// 等待读取完成或出错
 				select {
 				case <-doneCh:
-				// 读取完成
+					// 读取完成
 				case err := <-errorCh:
-					if receiveErr == nil { // 只记录第一个错误
+					if receiveErr == nil {
 						receiveErr = err
 					}
 				}
 
-			} else { // 使用 splice
+			} else {
 				// 使用splice系统调用
 				log.Printf("[%s] 使用 splice 系统调用传输数据", remoteAddrStr)
 				pipeFds := make([]int, 2)
 				if err := unix.Pipe(pipeFds); err != nil {
 					receiveErr = fmt.Errorf("创建管道失败: %w", err)
-					return // 退出匿名函数
+					return
 				}
 				defer unix.Close(pipeFds[0])
 				defer unix.Close(pipeFds[1])
@@ -756,7 +730,7 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					n, err := unix.Splice(srcFd, nil, pipeFds[1], nil, copyBufferSize, unix.SPLICE_F_MOVE|unix.SPLICE_F_MORE)
 					if err != nil {
 						receiveErr = fmt.Errorf("从 socket 到管道的 splice 操作失败: %w", err)
-						break // 退出循环去处理错误
+						break
 					}
 					if n == 0 {
 						break // 连接关闭
@@ -766,12 +740,12 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					written, err := unix.Splice(pipeFds[0], nil, dstFd, nil, int(n), unix.SPLICE_F_MOVE|unix.SPLICE_F_MORE)
 					if err != nil {
 						receiveErr = fmt.Errorf("从管道到文件 '%s' 的 splice 操作失败: %w", targetPath, err)
-						break // 退出循环去处理错误
+						break
 					}
 
 					if written != n {
 						receiveErr = fmt.Errorf("splice 写入文件 '%s' 不完整: 预期 %d, 实际 %d", targetPath, n, written)
-						break // 退出循环去处理错误
+						break
 					}
 
 					atomic.AddInt64(&transferred, written)
@@ -783,24 +757,19 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 						receiveErr = fmt.Errorf("文件 '%s' 接收到的数据大小 (%d) 与预期大小 (%d) 不符", fileName, totalReceived, fileSize)
 					}
 				}
-			} // End of if/else for useStandardCopy
-			// --- 传输结束 ---
-		}(conn) // 结束并调用匿名函数
+			}
+		}(conn)
 
-		// 显示传输完成信息
 		if fileTransferred > 0 && fileReceiveError == nil {
-			// 计算文件传输速度
 			elapsed := time.Since(connectionStart).Seconds()
 			fileAvgSpeed := float64(fileTransferred) / elapsed / 1024 / 1024
 			log.Printf("\x1b[32m[%s] 传输完成，文件 '%s' 接收了 %s bytes，速度: %.2f MB/s\x1b[0m",
 				remoteAddrStr, fileTransferName, formatWithCommas(fileTransferred), fileAvgSpeed)
 
-			// 更新总统计
 			atomic.AddInt64(&totalBytesReceived, fileTransferred)
 			totalFilesReceived++
 		}
 
-		// 计算总体平均速度并显示
 		totalElapsed := time.Since(startTime).Seconds()
 		if totalBytesReceived > 0 && totalElapsed > 0 {
 			overallAvgSpeed := float64(totalBytesReceived) / totalElapsed / 1024 / 1024
@@ -809,12 +778,10 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 		}
 
 		log.Printf("等待下一个连接...")
-	} // End of for loop
+	}
 	// 通常不会执行到这里 (因为 for 循环是无限的)
 	return nil
 }
-
-// 移除 networkSender 和 networkReceiver 函数
 
 // parseSize 解析带单位的大小字符串 (如 "1G", "500M", "1024K") 返回字节数
 // (strconv 和 strings 已在顶部导入)
