@@ -45,7 +45,7 @@ go build
 ### 基本参数
 
 ```
--mode string      运行模式: send (连接并发送) 或 receive (监听并接收) (默认 "send")
+-mode string      运行模式: send (发送) 或 receive (接收)
 -file string      要发送的文件路径 (send 模式)
 -dir string       保存文件的目录路径 (receive 模式) (默认 ".")
 -addr string      网络地址 (连接地址 for send, 监听地址 for receive) (默认 "localhost:8080")
@@ -67,10 +67,10 @@ go build
 
 ```
 -no-splice        接收端不使用 splice 系统调用 (使用标准 Go io.Copy)
--sndbuf int       设置 TCP 发送缓冲区大小 (字节, 0=系统默认)
--rcvbuf int       设置 TCP 接收缓冲区大小 (字节, 0=系统默认)
+-sndbuf int       设置 TCP 发送缓冲区大小 (4194304字节, 0=系统默认)
+-rcvbuf int       设置 TCP 接收缓冲区大小 (4194304字节, 0=系统默认)
 -odirect          接收端打开目标文件时使用 O_DIRECT (Linux only, 绕过页缓存, 谨慎使用!)
--size string      要传输的数据大小 (用于 send -file /dev/zero 时指定大小, 如 "1G", "500M", "1024K")
+-size string      要传输的数据大小 (用于 send -file /dev/zero 时指定大小, e.g., 1G, 500M, 1024K)
 -prewarm          发送端在程序启动时预热文件到页缓存 (仅 send 模式)
 ```
 
@@ -80,23 +80,23 @@ go build
 
 接收端：
 ```bash
-./ftgo -mode receive -dir ./received_files -addr localhost:8080
+ftgo -mode receive -dir ./received_files -addr localhost:8080
 ```
 
 发送端：
 ```bash
-./ftgo -mode send -file testfile.dat -addr localhost:8080 -prewarm
+ftgo -mode send -file testfile.dat -addr localhost:8080 -prewarm
 ```
 
 2. 网络传输测试：
 
 接收端：
 ```bash
-./ftgo -mode receive -dir /dev/null -addr localhost:8080
+ftgo -mode receive -dir /dev/null -addr localhost:8080
 ```
 发送端：
 ```bash
-./ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080
+ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080
 ```
 
 3. 使用高级选项：
@@ -126,9 +126,9 @@ go build
 ```
 
 ## 注意事项
-- 仅支持Linux
-- 发送/dev/zero时必须指定-size参数
-- O_DIRECT模式与标准IO复制(-no-splice)可能不兼容
+- 此程序仅在 Linux 系统上可用，因为它使用了 splice、sendfile 和 fallocate 等系统调用。
+- 谨慎使用 -odirect 标志，因为它会绕过页缓存，可能影响性能，并且有严格的对齐要求。
+- 发送 /dev/zero 时必须指定 -size 参数。
 
 
 ## 依赖

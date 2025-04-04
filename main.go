@@ -88,13 +88,13 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "\n示例:")
 		fmt.Fprintln(os.Stderr, "  发送本地文件:")
-		fmt.Fprintln(os.Stderr, "    ftgo -mode receive -dir ./received_files -addr localhost:8080 -no-splice")
+		fmt.Fprintln(os.Stderr, "    ftgo -mode receive -dir ./received_files -addr localhost:8080")
 		fmt.Fprintln(os.Stderr, "    ftgo -mode send -file testfile.dat -addr localhost:8080 -prewarm")
 		fmt.Fprintln(os.Stderr, "  传输性能测试示例:")
-		fmt.Fprintln(os.Stderr, "    发送端: ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080 -prewarm")
-		fmt.Fprintln(os.Stderr, "    接收端: ftgo -mode receive -dir ./received_files -addr localhost:8080 -no-splice")
+		fmt.Fprintln(os.Stderr, "    接收端: ftgo -mode receive -dir /dev/null -addr localhost:8080")
+		fmt.Fprintln(os.Stderr, "    发送端: ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080")
 		fmt.Fprintln(os.Stderr, "\n注意事项:")
-		fmt.Fprintln(os.Stderr, "  - 由于使用了 splice、sendfile 和 fallocate 等系统调用，建议在 Linux 系统上运行此程序。")
+		fmt.Fprintln(os.Stderr, "  - 此程序仅在 Linux 系统上可用，因为它使用了 splice、sendfile 和 fallocate 等系统调用。")
 		fmt.Fprintln(os.Stderr, "  - 谨慎使用 -odirect 标志，因为它会绕过页缓存，可能影响性能，并且有严格的对齐要求。")
 		fmt.Fprintln(os.Stderr, "  - 发送 /dev/zero 时必须指定 -size 参数。")
 	}
@@ -411,10 +411,10 @@ func sender(filePath string, connectAddr string) error {
 		log.Printf("\x1b[32m标准网络写入完成，总共发送 %d bytes\x1b[0m", totalSent)
 	}
 
-	// Short sleep allows the progress display goroutine to potentially update one last time
+	// 短暂休眠，允许进度显示的 goroutine 可能进行最后一次更新
 	time.Sleep(100 * time.Millisecond)
 
-	// Final check: ensure total sent bytes match the expected file size
+	// 最终检查: 确保发送的总字节数与预期文件大小匹配
 	if totalSent != fileSize {
 		return fmt.Errorf("最终发送字节数 (%d) 与预期文件大小 (%d) 不符", totalSent, fileSize)
 	}
