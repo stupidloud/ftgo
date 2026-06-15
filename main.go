@@ -513,7 +513,9 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			// 记录当前连接开始时间
 			connectionStart = time.Now()
 
-			var targetPath string
+			var targetPath string // 实际写入的路径 (常规文件时为临时 .part 文件)
+			var finalPath string  // 传输成功后改名到的正式路径
+			var useTempFile bool  // 是否启用临时文件 + 原子改名 (常规文件为 true, /dev/null 为 false)
 			var receiveErr error
 			var fileName string
 			var fileSize int64
@@ -523,6 +525,23 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 			defer func() {
 				if receiveErr != nil {
 					log.Printf("\x1b[31m[%s] 错误: %v\x1b[0m", remoteAddrStr, receiveErr)
+				}
+				// 临时文件收尾 (此时 dstFile 已由更晚注册的 defer 关闭):
+				// 成功则原子改名为正式文件, 失败则删除残缺临时文件, 避免留下/覆盖为不完整文件
+				if useTempFile {
+					if receiveErr == nil {
+						if err := os.Rename(targetPath, finalPath); err != nil {
+							receiveErr = fmt.Errorf("重命名临时文件 '%s' -> '%s' 失败: %w", targetPath, finalPath, err)
+							log.Printf("\x1b[31m[%s] 错误: %v\x1b[0m", remoteAddrStr, receiveErr)
+							os.Remove(targetPath)
+						}
+					} else {
+						if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+							log.Printf("\x1b[33m[%s] 警告: 删除残缺临时文件 '%s' 失败: %v\x1b[0m", remoteAddrStr, targetPath, err)
+						} else {
+							log.Printf("[%s] 已删除残缺临时文件 '%s'", remoteAddrStr, targetPath)
+						}
+					}
 				}
 				// 保存结果以便外部访问
 				fileReceiveError = receiveErr
@@ -569,8 +588,10 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					receiveErr = fmt.Errorf("创建目录 '%s' 失败: %w", dirPath, err)
 					return
 				}
-				targetPath = filepath.Join(dirPath, fileName)
-				log.Printf("\x1b[32m[%s] 将文件 '%s' 保存到: %s\x1b[0m", remoteAddrStr, fileName, targetPath)
+				finalPath = filepath.Join(dirPath, fileName)
+				targetPath = finalPath + ".part" // 先写临时文件, 全部成功后再原子改名
+				useTempFile = true
+				log.Printf("\x1b[32m[%s] 将文件 '%s' 保存到: %s (临时文件: %s)\x1b[0m", remoteAddrStr, fileName, finalPath, targetPath)
 			}
 
 			// 创建或打开目标文件/设备
