@@ -710,6 +710,13 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					}
 				}
 
+				// 与 splice 分支保持一致: 校验实际接收字节数是否等于声明大小
+				if receiveErr == nil {
+					if totalReceived != fileSize {
+						receiveErr = fmt.Errorf("文件 '%s' 接收到的数据大小 (%d) 与预期大小 (%d) 不符", fileName, totalReceived, fileSize)
+					}
+				}
+
 			} else {
 				// 使用splice系统调用
 				log.Printf("[%s] 使用 splice 系统调用传输数据", remoteAddrStr)

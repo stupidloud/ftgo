@@ -31,7 +31,7 @@
 
 ## 安装
 
-1. 确保已安装Go 1.24.1或更高版本
+1. 确保已安装Go 1.26或更高版本
 2. 克隆项目并构建：
 
 ```bash
@@ -133,5 +133,5 @@ ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080
 
 ## 依赖
 
-- Go 1.24.1+
+- Go 1.26+
 - golang.org/x/sys v0.31.0
