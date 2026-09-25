@@ -741,13 +741,17 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 				readCh := make(chan []byte) // 通道传递数据副本
 				errorCh := make(chan error, 1)
 				doneCh := make(chan struct{})
+				stopCh := make(chan struct{}) // 写入端提前退出时通知读取 goroutine, 避免它永远阻塞在 readCh 上
 
 				// 启动读取goroutine
 				go func() {
 					defer close(readCh)
 					defer close(doneCh)
-					for totalReceived < fileSize {
-						n, err := conn.Read(buffer)
+					// 用自己的计数判断是否读够: totalReceived 由写入循环更新, 读完最后一块时可能还没累加,
+					// 若据此继续 Read 会一直阻塞 (发送端要等确认才断开)
+					var readTotal int64
+					for readTotal < fileSize {
+						n, err := conn.Read(buffer[:min(int64(len(buffer)), fileSize-readTotal)])
 						if err != nil {
 							if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
 								return
@@ -764,7 +768,12 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 						// 创建数据副本并发送
 						dataCopy := make([]byte, n)
 						copy(dataCopy, buffer[:n])
-						readCh <- dataCopy
+						readTotal += int64(n)
+						select {
+						case readCh <- dataCopy:
+						case <-stopCh:
+							return
+						}
 					}
 				}()
 
@@ -791,15 +800,16 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					atomic.AddInt64(&transferred, int64(written))
 					totalReceived += int64(written) // totalReceived 仍然累加写入的字节数
 				}
+				close(stopCh)
 
-				// 等待读取完成或出错
+				// 等读取 goroutine 退出后再取错误 (读写两端的错误都在 errorCh 里)
+				<-doneCh
 				select {
-				case <-doneCh:
-					// 读取完成
 				case err := <-errorCh:
 					if receiveErr == nil {
 						receiveErr = err
 					}
+				default:
 				}
 
 				// 与 splice 分支保持一致: 校验实际接收字节数是否等于声明大小
