@@ -72,6 +72,7 @@ go build
 -odirect          接收端打开目标文件时使用 O_DIRECT (Linux only, 绕过页缓存, 谨慎使用!)
 -size string      要传输的数据大小 (用于 send -file /dev/zero 时指定大小, e.g., 1G, 500M, 1024K)
 -prewarm          发送端在程序启动时预热文件到页缓存 (仅 send 模式)
+-ack-timeout dur  发送端发完数据后等待接收端确认的超时时间 (默认 2m0s, 仅 send 模式)
 ```
 
 ## 示例
@@ -117,6 +118,11 @@ ftgo -mode send -file /dev/zero -size 10G -addr localhost:8080
 4. 对于/dev/zero性能测试，建议指定`-size`参数控制测试数据量
 
 ## 错误处理
+
+接收端先写 `文件名.part`，收齐数据并 fsync 后改名为正式文件，再向发送端回一个确认帧
+（`[1B 状态][2B 消息长度][消息]`，状态 0 = 已落盘，1 = 失败并附原因）。
+发送端只有收到成功确认才以退出码 0 结束；接收端报告失败、连接中断或在 `-ack-timeout` 内没收到确认都以退出码 1 结束，
+因此可以放心地在发送成功后删除源文件。发送端与接收端需使用同一版本（旧版接收端不会回确认）。
 
 传输错误：记录到failed_files.log文件
 

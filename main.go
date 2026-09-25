@@ -53,7 +53,27 @@ var (
 	oDirect  = flag.Bool("odirect", false, "接收端打开目标文件时使用 O_DIRECT (Linux only, 绕过页缓存, 谨慎使用!)")            // 添加缺失的 O_DIRECT 标志定义
 	sizeStr  = flag.String("size", "", "要传输的数据大小 (用于 send -file /dev/zero 时指定大小, e.g., 1G, 500M, 1024K)") // 更新 size 说明
 	prewarm  = flag.Bool("prewarm", false, "发送端在程序启动时预热文件到页缓存 (仅 send 模式)")
+	ackWait  = flag.Duration("ack-timeout", 120*time.Second, "发送端发完数据后等待接收端确认的超时时间 (send 模式)")
 )
+
+// 接收端确认帧: [1B 状态][2B 消息长度][消息], 状态 0 = 文件已 fsync 并改名为正式文件, 1 = 失败 (消息为原因)
+const (
+	ackOK   byte = 0
+	ackFail byte = 1
+)
+
+// AckError 表示发送端没有拿到接收端的成功确认 (接收端报告失败, 或确认超时/连接断开)
+type AckError struct {
+	Err error
+}
+
+func (e *AckError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *AckError) Unwrap() error {
+	return e.Err
+}
 
 type FileInfoError struct {
 	FilePath string
@@ -154,6 +174,10 @@ func main() {
 				os.Exit(1)
 			} else if e, ok := err.(*SendfileIOError); ok {
 				log.Printf("\x1b[31m发送端传输错误: %v\x1b[0m", e)
+				logFailedFile(*file, e.Error())
+				os.Exit(1)
+			} else if e, ok := err.(*AckError); ok {
+				log.Printf("\x1b[31m接收端未确认: %v\x1b[0m", e)
 				logFailedFile(*file, e.Error())
 				os.Exit(1)
 			} else {
@@ -362,7 +386,7 @@ func sender(filePath string, connectAddr string) error {
 				}
 				if errno, ok := err.(unix.Errno); ok && (errno == unix.EPIPE || errno == unix.ECONNRESET) {
 					log.Printf("发送端检测到连接断开 (sendfile): %v", err)
-					return fmt.Errorf("连接已断开: %w", err)
+					return connLost(conn, err)
 				}
 				return fmt.Errorf("sendfile 在偏移量 %d 失败: %w", currentOffset, err)
 			}
@@ -404,7 +428,7 @@ func sender(filePath string, connectAddr string) error {
 		if err != nil {
 			if opErr, ok := err.(*net.OpError); ok && (opErr.Err == unix.EPIPE || opErr.Err == unix.ECONNRESET) {
 				log.Printf("发送端检测到连接断开 (标准写入): %v", err)
-				return fmt.Errorf("连接已断开: %w", err)
+				return connLost(conn, err)
 			}
 			return fmt.Errorf("标准写入失败 (已发送 %d bytes): %w", totalSent, err)
 		}
@@ -419,8 +443,50 @@ func sender(filePath string, connectAddr string) error {
 		return fmt.Errorf("最终发送字节数 (%d) 与预期文件大小 (%d) 不符", totalSent, fileSize)
 	}
 
-	log.Printf("发送完成，总共发送 %s bytes", formatWithCommas(totalSent)) // Generic completion message
+	// 数据写进本机发送缓冲区不代表对方已落盘: 等接收端 fsync + 改名后的确认
+	log.Printf("数据已发出 %s bytes，等待接收端确认...", formatWithCommas(totalSent))
+	if err := readAck(conn, *ackWait); err != nil {
+		return err
+	}
+	log.Printf("发送完成，接收端已确认保存，总共发送 %s bytes", formatWithCommas(totalSent))
 	return nil
+}
+
+// restoreNonblock 把 socket 改回非阻塞模式。
+// sendfile/splice 用的 tcpConn.File().Fd() 会把 dup 出的 fd 设为阻塞, 而它与原 socket 共享
+// 同一个 open file description, 原 conn 也随之变成阻塞, Set*Deadline 随即失效。
+func restoreNonblock(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		if rc, err := tc.SyscallConn(); err == nil {
+			rc.Control(func(fd uintptr) { unix.SetNonblock(int(fd), true) })
+		}
+	}
+}
+
+// readAck 读取接收端的确认帧; 没收到成功确认一律返回 *AckError
+func readAck(conn net.Conn, timeout time.Duration) error {
+	restoreNonblock(conn)
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	hdr := make([]byte, 3)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return &AckError{Err: fmt.Errorf("未收到接收端确认: %w", err)}
+	}
+	msg := make([]byte, binary.BigEndian.Uint16(hdr[1:3]))
+	if _, err := io.ReadFull(conn, msg); err != nil {
+		return &AckError{Err: fmt.Errorf("读取接收端确认消息失败: %w", err)}
+	}
+	if hdr[0] != ackOK {
+		return &AckError{Err: fmt.Errorf("接收端保存失败: %s", msg)}
+	}
+	return nil
+}
+
+// connLost 在发送中途连接断开时, 尽量读出接收端回传的失败原因
+func connLost(conn net.Conn, err error) error {
+	if ackErr := readAck(conn, 2*time.Second); ackErr != nil {
+		return &AckError{Err: fmt.Errorf("连接已断开 (%v): %w", err, ackErr)}
+	}
+	return &AckError{Err: fmt.Errorf("连接已断开: %w", err)}
 }
 
 // --- 文件预热函数 (使用 Readahead 预热整个文件) ---
@@ -534,6 +600,9 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 							receiveErr = fmt.Errorf("重命名临时文件 '%s' -> '%s' 失败: %w", targetPath, finalPath, err)
 							log.Printf("\x1b[31m[%s] 错误: %v\x1b[0m", remoteAddrStr, receiveErr)
 							os.Remove(targetPath)
+						} else if err := syncDir(dirPath); err != nil {
+							// 改名已生效, 目录项未落盘只记警告, 不判失败
+							log.Printf("\x1b[33m[%s] 警告: 同步目录 '%s' 失败: %v\x1b[0m", remoteAddrStr, dirPath, err)
 						}
 					} else {
 						if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
@@ -543,6 +612,8 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 						}
 					}
 				}
+				// 告诉发送端结果: 只有文件已 fsync 并改名成功才回成功
+				sendAck(conn, receiveErr)
 				// 保存结果以便外部访问
 				fileReceiveError = receiveErr
 				fileTransferred = totalReceived
@@ -786,6 +857,13 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 					}
 				}
 			}
+
+			// 回确认前先把数据刷到磁盘, 否则确认后断电仍会丢文件 (发送端可能已删除源文件)
+			if receiveErr == nil && useTempFile {
+				if err := dstFile.Sync(); err != nil {
+					receiveErr = fmt.Errorf("同步文件 '%s' 到磁盘失败: %w", targetPath, err)
+				}
+			}
 		}(conn)
 
 		if fileTransferred > 0 && fileReceiveError == nil {
@@ -809,6 +887,36 @@ func receiver(dirPath string, listenAddr string, useStandardCopy bool) error {
 	}
 	// 通常不会执行到这里 (因为 for 循环是无限的)
 	return nil
+}
+
+// sendAck 向发送端回写确认帧; 写失败 (对方已断开) 只记日志
+func sendAck(conn net.Conn, recvErr error) {
+	status, msg := ackOK, ""
+	if recvErr != nil {
+		status, msg = ackFail, recvErr.Error()
+		if len(msg) > 65535 {
+			msg = msg[:65535]
+		}
+	}
+	frame := make([]byte, 3+len(msg))
+	frame[0] = status
+	binary.BigEndian.PutUint16(frame[1:3], uint16(len(msg)))
+	copy(frame[3:], msg)
+	restoreNonblock(conn)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(frame); err != nil {
+		log.Printf("\x1b[33m[%s] 警告: 回写确认失败: %v\x1b[0m", conn.RemoteAddr(), err)
+	}
+}
+
+// syncDir 让目录项 (改名结果) 落盘
+func syncDir(dirPath string) error {
+	d, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // parseSize 解析带单位的大小字符串 (如 "1G", "500M", "1024K") 返回字节数
