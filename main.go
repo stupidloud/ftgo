@@ -68,7 +68,6 @@ var (
 	badFile = "failed_files.log" // 记录传输失败的文件
 	sndBuf  = flag.Int("sndbuf", 0, "设置 UDP 发送缓冲区大小 (字节, 0=自动尝试 4MB)")
 	rcvBuf  = flag.Int("rcvbuf", 0, "设置 UDP 接收缓冲区大小 (字节, 0=自动尝试 32MB)")
-	oDirect = flag.Bool("odirect", false, "(UDP 版本不支持, 指定后忽略)")
 	sizeStr = flag.String("size", "", "要传输的数据大小 (用于 send -file /dev/zero 时指定大小, e.g., 1G, 500M, 1024K)") // 更新 size 说明
 	prewarm = flag.Bool("prewarm", false, "发送端在程序启动时预热文件到页缓存 (仅 send 模式)")
 	ackWait = flag.Duration("ack-timeout", 120*time.Second, "发送端每轮发完后等待接收端回应的超时时间 (send 模式)")
@@ -109,19 +108,6 @@ func (e *AckError) Error() string {
 }
 
 func (e *AckError) Unwrap() error {
-	return e.Err
-}
-
-type FileInfoError struct {
-	FilePath string
-	Err      error
-}
-
-func (e *FileInfoError) Error() string {
-	return fmt.Sprintf("文件 '%s' 处理失败: %v", e.FilePath, e.Err)
-}
-
-func (e *FileInfoError) Unwrap() error {
 	return e.Err
 }
 
@@ -189,9 +175,6 @@ func main() {
 	if *mode == "receive" && *dir == "" {
 		log.Fatal("错误: receive 模式下必须指定 -dir 参数")
 	}
-	if *oDirect {
-		log.Printf("\x1b[33m警告: UDP 版本不支持 -odirect, 已忽略\x1b[0m")
-	}
 
 	if *mode == "send" && *prewarm && *file != "/dev/zero" {
 		if err := doPrewarm(*file); err != nil {
@@ -202,28 +185,17 @@ func main() {
 
 	switch *mode {
 	case "send":
-		err := sender(*file, *addr)
-		if err != nil {
-			if _, ok := err.(*net.OpError); ok {
-				log.Fatalf("\x1b[31m发送端网络错误: %v\x1b[0m", err)
-			} else if _, ok := err.(*FileInfoError); ok {
-				log.Printf("\x1b[31m发送端文件错误: %v\x1b[0m", err)
-				os.Exit(1)
-			} else if e, ok := err.(*ReadIOError); ok {
-				log.Printf("\x1b[31m发送端读取错误: %v\x1b[0m", e)
-				logFailedFile(*file, e.Error())
-				os.Exit(1)
-			} else if e, ok := err.(*AckError); ok {
-				log.Printf("\x1b[31m接收端未确认: %v\x1b[0m", e)
-				logFailedFile(*file, e.Error())
-				os.Exit(1)
-			} else {
-				log.Printf("\x1b[31m发送端未知错误: %v\x1b[0m", err)
-				os.Exit(1)
+		if err := sender(*file, *addr); err != nil {
+			log.Printf("\x1b[31m发送失败: %v\x1b[0m", err)
+			// 传输开始后的失败 (读文件出错、接收端未确认) 记入失败日志, 便于重传
+			var ackErr *AckError
+			var readErr *ReadIOError
+			if errors.As(err, &ackErr) || errors.As(err, &readErr) {
+				logFailedFile(*file, err.Error())
 			}
-		} else {
-			fmt.Println("文件发送成功完成.")
+			os.Exit(1)
 		}
+		fmt.Println("文件发送成功完成.")
 	case "receive":
 		err := receiver(*dir, *addr) // receiver handles /dev/null internally
 		if err != nil {
@@ -250,47 +222,25 @@ func logFailedFile(filePath string, reason string) {
 }
 
 func displayProgress(totalSize int64, transferred *int64, startTime time.Time, done chan struct{}) {
+	show := func(end string) {
+		current := atomic.LoadInt64(transferred)
+		elapsed := max(time.Since(startTime).Seconds(), 0.1)
+		progress := 100.0
+		if totalSize > 0 {
+			progress = min(float64(current)*100/float64(totalSize), 100)
+		}
+		fmt.Printf("\r\033[K进度: %.2f%% (%s/%s bytes), 速度: %.2f MB/s%s", progress,
+			formatWithCommas(current), formatWithCommas(totalSize), float64(current)/elapsed/1024/1024, end)
+	}
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	fmt.Printf("\r\033[K进度: 0.00%% (0/%d bytes), 速度: 0.00 MB/s", totalSize)
+	show("")
 	for {
 		select {
 		case <-ticker.C:
-			currentTransferred := atomic.LoadInt64(transferred)
-			elapsed := time.Since(startTime).Seconds()
-			if elapsed < 0.1 {
-				elapsed = 0.1
-			}
-			speed := float64(currentTransferred) / elapsed / 1024 / 1024
-			var progress float64
-			if totalSize > 0 {
-				progress = float64(currentTransferred) * 100 / float64(totalSize)
-			} else if currentTransferred == 0 && totalSize == 0 {
-				progress = 100.0
-			} else {
-				progress = 0.0
-			}
-			if progress > 100.0 {
-				progress = 100.0
-			}
-			fmt.Printf("\r\033[K进度: %.2f%% (%s/%s bytes), 速度: %.2f MB/s", progress, formatWithCommas(currentTransferred), formatWithCommas(totalSize), speed)
+			show("")
 		case <-done:
-			currentTransferred := atomic.LoadInt64(transferred)
-			elapsed := time.Since(startTime).Seconds()
-			if elapsed < 0.1 {
-				elapsed = 0.1
-			}
-			speed := float64(currentTransferred) / elapsed / 1024 / 1024
-			var progress float64
-			if totalSize > 0 {
-				progress = float64(currentTransferred) * 100 / float64(totalSize)
-			} else {
-				progress = 100.0
-			}
-			if progress > 100.0 {
-				progress = 100.0
-			}
-			fmt.Printf("\r\033[K进度: %.2f%% (%s/%s bytes), 速度: %.2f MB/s\n", progress, formatWithCommas(currentTransferred), formatWithCommas(totalSize), speed)
+			show("\n")
 			return
 		}
 	}
@@ -396,13 +346,13 @@ func sender(filePath string, connectAddr string) error {
 	} else {
 		fileInfo, err := os.Stat(filePath)
 		if err != nil {
-			return &FileInfoError{FilePath: filePath, Err: err}
+			return fmt.Errorf("文件 '%s' 处理失败: %w", filePath, err)
 		}
 		fileSize = fileInfo.Size()
 		fileName = fileInfo.Name() // 获取真实文件名
 		srcFile, err = os.Open(filePath)
 		if err != nil {
-			return &FileInfoError{FilePath: filePath, Err: fmt.Errorf("打开源文件失败: %w", err)}
+			return fmt.Errorf("打开源文件 '%s' 失败: %w", filePath, err)
 		}
 		defer srcFile.Close()
 		unix.Fadvise(int(srcFile.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
@@ -910,7 +860,7 @@ func receiveFile(conn net.Conn, udpConn *net.UDPConn, dirPath string) (fileName 
 		var err error
 		dstFile, err = os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 		if err != nil {
-			return fileName, 0, &FileInfoError{FilePath: targetPath, Err: fmt.Errorf("创建/打开目标文件 '%s' 失败: %w", targetPath, err)}
+			return fileName, 0, fmt.Errorf("创建/打开目标文件 '%s' 失败: %w", targetPath, err)
 		}
 		defer dstFile.Close()
 

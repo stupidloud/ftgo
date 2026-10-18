@@ -17,7 +17,6 @@
 - TCP缓冲区大小可调优
 - 文件预热(prewarm)功能，提高传输速度
 - 支持/dev/zero和/dev/null特殊文件处理
-- 支持O_DIRECT模式(绕过页缓存)
 - 详细的错误处理和日志记录
 
 ## 性能对比
@@ -70,7 +69,6 @@ go build
 -payload int      每个 UDP 包的载荷字节数 (默认 1400; 路径 MTU 1500 时不要超过 1452)
 -sndbuf int       设置 UDP 发送缓冲区大小 (字节, 0=自动尝试 4MB)
 -rcvbuf int       设置 UDP 接收缓冲区大小 (字节, 0=自动尝试 32MB)
--odirect          UDP 版本不支持, 指定后忽略
 -size string      要传输的数据大小 (用于 send -file /dev/zero 时指定大小, e.g., 1G, 500M, 1024K)
 -prewarm          发送端在程序启动时预热文件到页缓存 (仅 send 模式)
 -ack-timeout dur  发送端每轮发完后等待接收端回应的超时时间 (默认 2m0s, 仅 send 模式)
