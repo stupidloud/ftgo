@@ -78,8 +78,8 @@ var (
 // 控制通道 (TCP) 消息, 首字节为类型。
 // 接收端 → 发送端:
 //
-//	ackOK / ackFail / msgReady: [1B 类型][2B 消息长度][消息]
-//	msgNack:                    [1B 类型][4B 区间数][区间数 × (8B 起始块号, 4B 块数)]
+//	ackOK / ackFail / msgReady / msgQueued: [1B 类型][2B 消息长度][消息]
+//	msgNack:                                [1B 类型][4B 区间数][区间数 × (8B 起始块号, 4B 块数)]
 //
 // 发送端 → 接收端 (文件头之后):
 //
@@ -90,6 +90,7 @@ const (
 	msgReady    byte = 2 // 接收端已打开文件, 可以开始发 UDP
 	msgNack     byte = 3
 	msgRoundEnd byte = 4
+	msgQueued   byte = 5 // 接收端正在处理其他传输, 消息为排队情况; 轮到时再发 msgReady
 )
 
 // chunkRange 是一段连续的块号 [first, first+count)
@@ -276,7 +277,7 @@ func readCtrl(conn net.Conn) ctrlMsg {
 	}
 	m := ctrlMsg{typ: typ[0]}
 	switch m.typ {
-	case ackOK, ackFail, msgReady:
+	case ackOK, ackFail, msgReady, msgQueued:
 		lenBytes := make([]byte, 2)
 		if _, err := io.ReadFull(conn, lenBytes); err != nil {
 			return ctrlMsg{err: err}
@@ -382,16 +383,24 @@ func sender(filePath string, connectAddr string) error {
 	defer close(stopCtrl)
 	go readCtrlLoop(conn, ctrl, stopCtrl)
 
-	// 2. 等接收端就绪 (已打开文件、准备好收 UDP)
-	m, err := waitCtrl(ctrl, 30*time.Second)
-	if err != nil {
-		return err
-	}
-	if m.typ == ackFail {
-		return &AckError{Err: fmt.Errorf("接收端拒绝: %s", m.text)}
-	}
-	if m.typ != msgReady {
-		return &AckError{Err: fmt.Errorf("期望就绪消息, 收到类型 %d", m.typ)}
+	// 2. 等接收端就绪 (已打开文件、准备好收 UDP)。接收端正忙时会先回排队消息, 不限时一直等到轮到为止;
+	//    连接断开由 TCP keepalive 发现
+waitReady:
+	for {
+		m := <-ctrl
+		if m.err != nil {
+			return &AckError{Err: fmt.Errorf("等待接收端就绪时控制连接中断: %w", m.err)}
+		}
+		switch m.typ {
+		case msgReady:
+			break waitReady
+		case msgQueued:
+			log.Printf("\x1b[33m接收端正忙, 排队等待中: %s\x1b[0m", m.text)
+		case ackFail:
+			return &AckError{Err: fmt.Errorf("接收端拒绝: %s", m.text)}
+		default:
+			return &AckError{Err: fmt.Errorf("期望就绪消息, 收到类型 %d", m.typ)}
+		}
 	}
 
 	// 3. UDP 数据通道: 与 TCP 连接的对端 IP、端口相同
@@ -742,23 +751,30 @@ func receiver(dirPath string, listenAddr string) error {
 	setUDPBuffer(udpConn, *rcvBuf, defaultUDPRcvBuf, true)
 	log.Printf("\x1b[32m服务器启动，正在监听 %s (TCP 控制 + UDP 数据)\x1b[0m", listenAddr)
 
-	for { // 无限循环，顺序处理连接
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("\x1b[33m警告: 接受连接失败: %v\x1b[0m", err)
-			// 检查是否是监听器关闭导致的错误
-			if errors.Is(err, net.ErrClosed) {
-				log.Println("监听器已关闭，服务器退出。")
-				return nil // 正常退出
+	// 接受连接放在单独的协程里, 处理当前传输时新连接进队列排队, 并告诉对方前面还有几个
+	queue := newConnQueue()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Printf("\x1b[33m警告: 接受连接失败: %v\x1b[0m", err)
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				continue // 其他接受错误，继续等待下一个连接
 			}
-			continue // 其他接受错误，继续等待下一个连接
+			queue.push(conn)
 		}
+	}()
 
+	for { // 按到达顺序逐个处理连接
+		conn := queue.next()
 		remoteAddrStr := conn.RemoteAddr().String()
-		log.Printf("[%s] 接收到连接，开始处理...", remoteAddrStr)
+		log.Printf("[%s] 开始处理连接...", remoteAddrStr)
 		connectionStart := time.Now()
 
 		fileName, fileTransferred, fileReceiveError := receiveFile(conn, udpConn, dirPath)
+		queue.done()
 
 		if fileTransferred > 0 && fileReceiveError == nil {
 			elapsed := time.Since(connectionStart).Seconds()
@@ -779,6 +795,63 @@ func receiver(dirPath string, listenAddr string) error {
 
 		log.Printf("等待下一个连接...")
 	}
+}
+
+// connQueue 是等待处理的发送端连接, 按到达顺序排队
+type connQueue struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	conns []net.Conn
+	busy  bool // 是否有传输正在进行
+}
+
+func newConnQueue() *connQueue {
+	q := &connQueue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// push 把新连接放到队尾; 前面有其他传输时通知发送端它在排队
+func (q *connQueue) push(conn net.Conn) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.conns = append(q.conns, conn)
+	ahead := len(q.conns) - 1
+	if q.busy {
+		ahead++
+	}
+	if ahead > 0 {
+		log.Printf("[%s] 接收到连接, 正在处理其他传输, 排队等待 (前面还有 %d 个)", conn.RemoteAddr(), ahead)
+		notifyQueued(conn, ahead)
+	}
+	q.cond.Signal()
+}
+
+// next 取出队首连接 (队列空时等待), 并把新的排队位置告诉其余发送端
+func (q *connQueue) next() net.Conn {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.conns) == 0 {
+		q.cond.Wait()
+	}
+	conn := q.conns[0]
+	q.conns = q.conns[1:]
+	q.busy = true
+	for i, c := range q.conns {
+		notifyQueued(c, i+1)
+	}
+	return conn
+}
+
+// done 表示当前传输已处理完
+func (q *connQueue) done() {
+	q.mu.Lock()
+	q.busy = false
+	q.mu.Unlock()
+}
+
+func notifyQueued(conn net.Conn, ahead int) {
+	writeFrame(conn, msgQueued, fmt.Sprintf("前面还有 %d 个传输", ahead))
 }
 
 // receiveFile 处理一个发送端连接: 读文件头、收 UDP 数据、按轮次回 NACK, 最后校验并回确认
@@ -1266,14 +1339,19 @@ func sendNack(conn net.Conn, ranges []chunkRange) error {
 	return err
 }
 
-// sendFrame 向发送端回写 [1B 类型][2B 长度][消息] 帧; recvErr 非空时改为失败确认。写失败 (对方已断开) 只记日志
+// sendFrame 向发送端回写控制帧; recvErr 非空时改为失败确认
 func sendFrame(conn net.Conn, typ byte, recvErr error) {
 	msg := ""
 	if recvErr != nil {
 		typ, msg = ackFail, recvErr.Error()
-		if len(msg) > 65535 {
-			msg = msg[:65535]
-		}
+	}
+	writeFrame(conn, typ, msg)
+}
+
+// writeFrame 写 [1B 类型][2B 长度][消息] 帧。写失败 (对方已断开) 只记日志
+func writeFrame(conn net.Conn, typ byte, msg string) {
+	if len(msg) > 65535 {
+		msg = msg[:65535]
 	}
 	frame := make([]byte, 3+len(msg))
 	frame[0] = typ
